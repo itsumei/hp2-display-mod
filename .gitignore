@@ -3,6 +3,7 @@
 __pycache__/
 *.asi
 *.dll
+!/third_party/Ultimate-ASI-Loader/d3d8.dll
 *.exe
 *.pdb
 *.obj

@@ -31,27 +31,48 @@ def build_release(tag: str, output: Path | None) -> Path:
     # Build from the tagged tree so uncommitted files cannot affect the release.
     reference = f"refs/tags/{tag}^{{commit}}"
     commit = subprocess.check_output(["git", "rev-parse", "--verify", reference], cwd=root, text=True).strip()
-    snapshot = subprocess.check_output(["git", "archive", "--format=zip", commit], cwd=root)
+    source_name = f"HP2Mod-{tag}"
+    snapshot = subprocess.check_output(
+        ["git", "archive", "--format=zip", f"--prefix={source_name}/", commit], cwd=root
+    )
     output = (output or root / "dist").resolve()
     output.mkdir(parents=True, exist_ok=True)
     stem = f"HP2Mod-{tag}-win32"
 
     with staging_directory(output) as staging:
-        project = staging / "source"
+        project = staging / source_name
         with zipfile.ZipFile(io.BytesIO(snapshot)) as source:
-            source.extractall(project)
+            source.extractall(staging)
+        loader = (project / "third_party/Ultimate-ASI-Loader/d3d8.dll").read_bytes()
+        if hashlib.sha256(loader).hexdigest() != "9a2bb218ab014fa4ad56104108c26ae48bf3e22595c126cd4f41367c799da722":
+            raise ValueError("The bundled d3d8.dll does not match the tested loader")
+
         plugin = project / "out" / "HP2Display.asi"
         subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
              str(project / "HP2Display" / "build.ps1"), "-OutputPath", str(plugin)],
             cwd=project, check=True,
         )
+        widescreen_output = project / "out" / "HP2WSFix"
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+             str(project / "HP2WSFix" / "build.ps1"), "-OutputDirectory", str(widescreen_output)],
+            cwd=project, check=True,
+        )
 
-        # Keep the public payload explicit. Game binaries and local profiles live elsewhere.
         payload = {
+            "d3d8.dll": loader,
+            "global.ini": (project / "config/global.ini").read_bytes(),
             "scripts/HP2Display.asi": plugin.read_bytes(),
             "scripts/HP2Display.ini": (project / "config/HP2Display.ini").read_bytes(),
-            "patch_widescreen.py": (project / "HP2Display/patch_widescreen.py").read_bytes(),
+            "scripts/HP2WSFix.asi": (widescreen_output / "HP2WSFix.asi").read_bytes(),
+            "scripts/HP2WSFix.ini": (project / "config/HP2WSFix.ini").read_bytes(),
+            "scripts/HP2WSFix_LowMem.ini": (project / "config/HP2WSFix_LowMem.ini").read_bytes(),
+            "licenses/HP2WSFix.txt": (project / "HP2WSFix/LICENSE").read_bytes(),
+            "licenses/injector.txt": (project / "HP2WSFix/includes/injector/LICENSE").read_bytes(),
+            "licenses/Hooking.Patterns.txt": (project / "HP2WSFix/includes/hooking/LICENSE.txt").read_bytes(),
+            "licenses/Ultimate-ASI-Loader.txt": (project / "third_party/licenses/Ultimate-ASI-Loader.txt").read_bytes(),
+            "licenses/d3d8to9.txt": (project / "third_party/licenses/d3d8to9.txt").read_bytes(),
             "THIRD_PARTY.md": (project / "THIRD_PARTY.md").read_bytes(),
             "README.md": (project / "README.md").read_bytes(),
             "CHANGELOG.md": (project / "CHANGELOG.md").read_bytes(),
@@ -61,6 +82,7 @@ def build_release(tag: str, output: Path | None) -> Path:
             "docs/INSTALL.md": (project / "docs/INSTALL.md").read_bytes(),
             "docs/HP2WSFix.md": (project / "docs/HP2WSFix.md").read_bytes(),
             "docs/TESTING.md": (project / "docs/TESTING.md").read_bytes(),
+            "docs/STEAM-GUIDE.md": (project / "docs/STEAM-GUIDE.md").read_bytes(),
         }
         hashes = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in payload.items())
         metadata = f"tag={tag}\ncommit={commit}\n\n{hashes}"
@@ -75,6 +97,9 @@ def build_release(tag: str, output: Path | None) -> Path:
         final_zip = output / candidate.name
         candidate.replace(final_zip)
         checksum.replace(output / checksum.name)
+        source_zip = staging / f"{source_name}-source.zip"
+        source_zip.write_bytes(snapshot)
+        source_zip.replace(output / source_zip.name)
     return final_zip
 
 
