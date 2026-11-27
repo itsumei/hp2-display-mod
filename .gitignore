@@ -1,0 +1,11 @@
+/out/
+/dist/
+__pycache__/
+*.asi
+*.dll
+*.exe
+*.pdb
+*.obj
+*.log
+*.sav
+HP2FrameTrace-*.csv
