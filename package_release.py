@@ -28,6 +28,7 @@ def build_release(tag: str, output: Path | None) -> Path:
         raise ValueError("Expected a release tag like v0.1.0")
 
     root = Path(__file__).resolve().parent
+    # Build from the tagged tree so uncommitted files cannot affect the release.
     reference = f"refs/tags/{tag}^{{commit}}"
     commit = subprocess.check_output(["git", "rev-parse", "--verify", reference], cwd=root, text=True).strip()
     snapshot = subprocess.check_output(["git", "archive", "--format=zip", commit], cwd=root)
@@ -46,6 +47,7 @@ def build_release(tag: str, output: Path | None) -> Path:
             cwd=project, check=True,
         )
 
+        # Keep the public payload explicit. Game binaries and local profiles live elsewhere.
         payload = {
             "scripts/HP2Display.asi": plugin.read_bytes(),
             "scripts/HP2Display.ini": (project / "config/HP2Display.ini").read_bytes(),

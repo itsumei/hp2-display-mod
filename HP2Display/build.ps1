@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ($Verify) {
+    # The test harness uses known x86 call sites from this exact executable.
     if (-not $GameRoot) { throw 'Supply -GameRoot when running -Verify.' }
     $game = (Resolve-Path -LiteralPath $GameRoot).Path
     $exe = Join-Path $game 'NFSHP2.exe'
@@ -54,6 +55,7 @@ try {
         "/LIBPATH:$sdk/Lib/$version/ucrt/x86" @libraries
     if ($LASTEXITCODE -ne 0) { throw "HP2Display build failed with exit code $LASTEXITCODE." }
     if ($Verify) {
+        # Load the game's Direct3D wrapper in isolation, with third-party ASIs disabled.
         $wrapper = Join-Path $tempDir 'd3d8.dll'
         Copy-Item -LiteralPath (Join-Path $game 'd3d8.dll') -Destination $wrapper
         @('[GlobalSets]', 'LoadPlugins=0', 'UseD3D8to9=1') | Set-Content -LiteralPath (Join-Path $tempDir 'global.ini') -Encoding ascii

@@ -274,6 +274,7 @@ HRESULT WINAPI MockCheckMultisample(void*, UINT adapter, DWORD type, DWORD forma
 }
 
 void VerifyMultisampleSelection() {
+    // The mock rejects 8x for depth and 4x on device creation, so 2x must succeed.
     msaaSamples = 8;
     PresentParameters mode{1920, 1080, 22, 1, 0, CopyVsync, nullptr, FALSE, TRUE, 75, 0, 60, 0};
     auto options = CheckMultisampling(&mockD3d, 4, 1, mode);
@@ -497,7 +498,7 @@ int wmain(int argc, wchar_t** argv) {
     assert(InstallHooks(image));
     BYTE* race = image + raceViewSite.rva;
     assert(memcmp(race, raceViewSite.expected, raceViewSite.size) == 0);
-    assert(LoadSettings(nullptr, nullptr, nullptr) && !raceInterpolation);
+    assert(LoadSettings(nullptr, nullptr, nullptr) && !raceInterpolation && msaaSamples == DefaultMsaaSamples);
     assert(memcmp(race, raceViewSite.expected, raceViewSite.size) == 0);
     BYTE* car = image + carViewSite.rva;
     car[1] ^= 1;
@@ -599,7 +600,8 @@ int wmain(int argc, wchar_t** argv) {
     assert(mode.width == 1920 && mode.height == 1080 && mode.refreshHz == realRates.front());
     printf("Real x86 wrapper: %ux%u at %u Hz after CreateDevice / Reset / Present\n",
            mode.width, mode.height, mode.refreshHz);
-    msaaSamples = 4;
+    // Request the release default. Pixel readback below checks the mode actually created.
+    msaaSamples = DefaultMsaaSamples;
     input.flags = 0;
     input.autoDepthStencil = TRUE;
     input.depthStencilFormat = 75;

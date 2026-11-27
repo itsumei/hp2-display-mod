@@ -142,6 +142,7 @@ void ClearRaceHistory() {
 
 RenderFrame SampleRenderClock(RenderClock& clock, DWORD tick, LONGLONG now, LONGLONG frequency) {
     const double period = frequency / SimulationHz;
+    // Drop stale poses after a pause, a skipped tick, or a clock discontinuity.
     if (!clock.tracked || tick < clock.tick || tick - clock.tick > 1 ||
         now < clock.lastFrame || now - clock.lastFrame > frequency / 12 ||
         now - clock.tickStart > frequency / 12) {
@@ -276,6 +277,7 @@ struct PresentTrace {
     bool haveTick, finished;
     SYSTEMTIME localStart;
     size_t size;
+    // Buffer samples so the render thread does not write CSV rows during capture.
     PresentTraceRow rows[65536];
 };
 
@@ -329,6 +331,7 @@ void RecordPresent(LONGLONG entered, LONGLONG returned, DWORD tick, bool race, b
                    UINT carCount, HRESULT result) {
     auto& trace = frameTrace;
     if (!trace.size) {
+        // Start on the first successful frame with active simulation, after menus and loading.
         bool moving = trace.haveTick && tick > trace.previousTick &&
                       (!raceInterpolation || race) && result == S_OK;
         trace.haveTick = true;
@@ -365,7 +368,10 @@ UINT ParseRefreshLimit(const wchar_t* setting) {
     return value;
 }
 
+constexpr UINT DefaultMsaaSamples = 8;
+
 BOOL CALLBACK LoadSettings(PINIT_ONCE, PVOID, PVOID*) {
+    // Keep the config and diagnostics beside the ASI, regardless of the working directory.
     wchar_t path[MAX_PATH];
     DWORD count = GetModuleFileNameW(pluginModule, path, MAX_PATH);
     wchar_t* leaf = (count != 0 && count < MAX_PATH) ? wcsrchr(path, L'\\') : nullptr;
@@ -381,7 +387,7 @@ BOOL CALLBACK LoadSettings(PINIT_ONCE, PVOID, PVOID*) {
     maxRefreshHz = ParseRefreshLimit(refresh);
     int sync = static_cast<int>(GetPrivateProfileIntW(L"Display", L"VSync", 1, path));
     vsync = (sync >= -1 && sync <= 1) ? sync : 1;
-    UINT aa = GetPrivateProfileIntW(L"Graphics", L"MSAA", 0, path);
+    UINT aa = GetPrivateProfileIntW(L"Graphics", L"MSAA", DefaultMsaaSamples, path);
     msaaSamples = (aa == 2 || aa == 4 || aa == 8) ? aa : 0;
     UINT seconds = GetPrivateProfileIntW(L"Diagnostics", L"SampleSeconds", 5, path);
     sampleSeconds = seconds <= 60 ? seconds : 5;
@@ -426,6 +432,7 @@ std::vector<UINT> EnumerateRefreshRates(void* d3d, UINT adapter, DWORD deviceTyp
 template<class ApplyMode>
 HRESULT SetDisplayMode(const char* stage, void* d3d, UINT adapter, DWORD deviceType,
                        PresentParameters* parameters, ApplyMode apply) {
+    // The desktop controls the refresh rate of windowed devices.
     if (parameters->windowed) return apply(parameters);
 
     auto rates = EnumerateRefreshRates(d3d, adapter, deviceType, *parameters);
@@ -448,6 +455,7 @@ HRESULT SetDisplayMode(const char* stage, void* d3d, UINT adapter, DWORD deviceT
     bool triedOriginal = false;
     for (UINT rate : rates) {
         triedOriginal = triedOriginal || (rate == parameters->refreshHz && interval == parameters->interval);
+        // A failed driver call can mutate its input. Retry from the game's original parameters.
         PresentParameters proposed = *parameters;
         proposed.refreshHz = rate;
         proposed.interval = interval;
@@ -482,6 +490,7 @@ MultisampleModes CheckMultisampling(void* d3d, UINT adapter, DWORD type, const P
     }
 
     auto check = ComMethod<HRESULT (WINAPI*)(void*, UINT, DWORD, DWORD, BOOL, DWORD)>(d3d, 11);
+    // A usable sample count must be supported by both the color and automatic depth buffers.
     for (DWORD samples : {8ul, 4ul, 2ul}) {
         if (samples > msaaSamples || FAILED(check(d3d, adapter, type, colorFormat, parameters.windowed, samples))) continue;
         if (parameters.autoDepthStencil &&
@@ -763,6 +772,7 @@ HRESULT WINAPI OnReset(void* device, PresentParameters* parameters) {
 
 HRESULT WINAPI OnPresent(void* device, const RECT* source, const RECT* destination,
                          HWND window, const RGNDATA* dirty) {
+    // Consume render diagnostics once, even if Present fails or the next frame is a menu.
     bool cameraBlended = cameraBlendedThisFrame;
     bool playerBlended = playerBlendedThisFrame;
     UINT carsBlended = carsBlendedThisFrame;
@@ -892,6 +902,7 @@ void __fastcall RenderCar(BYTE* renderer, void*, const BYTE* director,
         const BYTE* car;
         memcpy(&car, renderer + 0xF88, sizeof(car));
         CarHistory* reusable = nullptr;
+        // A renderer slot can be assigned to another car. Key history by both pointers.
         for (auto& candidate : cars) {
             if (candidate.renderer == renderer && candidate.car == car) {
                 reusable = &candidate;
@@ -930,6 +941,7 @@ void WINAPI RenderRaceView(BYTE* director, int viewCount) {
     if (lastDirector != director) ClearRaceHistory();
     if (frameTraceSeconds && !frameTrace.finished) raceViewThisFrame = true;
     lastDirector = director;
+    // All cars and the camera use the same tick and blend fraction for this view.
     raceFrame = SampleRenderClock(raceClock, *gameTick, now.QuadPart, counterFrequency.QuadPart);
     if (raceFrame.reset) memset(cars, 0, sizeof(cars));
     raceDirector = director;
@@ -1090,6 +1102,7 @@ bool InstallRaceHooks(BYTE* image) {
 }
 
 bool InstallHooks(BYTE* image) {
+    // Check the executable and every required call site before writing any hooks.
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
