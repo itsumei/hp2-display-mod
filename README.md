@@ -1,4 +1,4 @@
-# Need For Speed Hot Pursuit 2 Display Mod
+# Need For Speed Hot Pursuit 2 Display Mod Fix and Improvements
 
 Мод для PC-версии Need for Speed: Hot Pursuit 2 (2002). Поддерживает широкоформатные заставки, автоматический выбор частоты монитора, интерполяцию камеры и машин, счётчик FPS и MSAA.
 
