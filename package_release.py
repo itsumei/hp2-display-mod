@@ -1,13 +1,26 @@
 """Build and package the public mod payload from a Git version tag."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import io
 from pathlib import Path
 import re
+import shutil
 import subprocess
-import tempfile
+from uuid import uuid4
 import zipfile
+
+
+@contextmanager
+def staging_directory(parent: Path):
+    staging = parent / f".hp2-build-{uuid4().hex}"
+    staging.mkdir()
+    try:
+        yield staging
+    finally:
+        if staging.resolve() == staging and staging.parent == parent:
+            shutil.rmtree(staging)
 
 
 def build_release(tag: str, output: Path | None) -> Path:
@@ -22,8 +35,8 @@ def build_release(tag: str, output: Path | None) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     stem = f"HP2Mod-{tag}-win32"
 
-    with tempfile.TemporaryDirectory(prefix="hp2-release-") as directory:
-        project = Path(directory)
+    with staging_directory(output) as staging:
+        project = staging / "source"
         with zipfile.ZipFile(io.BytesIO(snapshot)) as source:
             source.extractall(project)
         plugin = project / "out" / "HP2Display.asi"
@@ -49,18 +62,17 @@ def build_release(tag: str, output: Path | None) -> Path:
         }
         hashes = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in payload.items())
         metadata = f"tag={tag}\ncommit={commit}\n\n{hashes}"
-        with tempfile.TemporaryDirectory(prefix=".hp2-package-", dir=output) as staging:
-            candidate = Path(staging) / f"{stem}.zip"
-            with zipfile.ZipFile(candidate, "w", zipfile.ZIP_DEFLATED) as archive:
-                for name, data in payload.items():
-                    archive.writestr(name, data)
-                archive.writestr("BUILD-INFO.txt", metadata)
-            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            checksum = Path(staging) / f"{stem}.zip.sha256"
-            checksum.write_text(f"{digest}  {candidate.name}\n", encoding="ascii")
-            final_zip = output / candidate.name
-            candidate.replace(final_zip)
-            checksum.replace(output / checksum.name)
+        candidate = staging / f"{stem}.zip"
+        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in payload.items():
+                archive.writestr(name, data)
+            archive.writestr("BUILD-INFO.txt", metadata)
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        checksum = staging / f"{stem}.zip.sha256"
+        checksum.write_text(f"{digest}  {candidate.name}\n", encoding="ascii")
+        final_zip = output / candidate.name
+        candidate.replace(final_zip)
+        checksum.replace(output / checksum.name)
     return final_zip
 
 
