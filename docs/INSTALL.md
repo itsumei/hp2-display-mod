@@ -1,6 +1,6 @@
 # Установка, настройки и откат
 
-Эта инструкция относится к **v0.3.0-rc.1**. Комплект содержит единый `HP2Display.asi` со встроенным HP2WSFix 2.5. Для прошлых версий используйте инструкции из их тегов. [v0.2.0](https://github.com/itsumei/hp2-display-mod/blob/v0.2.0/docs/INSTALL.md) · [v0.1.0](https://github.com/itsumei/hp2-display-mod/blob/v0.1.0/docs/INSTALL.md)
+Эта инструкция относится к **v0.3.0-rc.2**. Комплект содержит единый `HP2Display.asi` со встроенным HP2WSFix 2.5. Для прошлых версий используйте инструкции из их тегов. [v0.2.0](https://github.com/itsumei/hp2-display-mod/blob/v0.2.0/docs/INSTALL.md) · [v0.1.0](https://github.com/itsumei/hp2-display-mod/blob/v0.1.0/docs/INSTALL.md)
 
 ## Совместимость
 

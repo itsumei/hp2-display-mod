@@ -1198,6 +1198,29 @@ __declspec(naked) void MovieLayoutThunk() {
     }
 }
 
+const float MovieHalfTexel = 0.5f;
+
+__declspec(naked) void MovieRightEdgeThunk() {
+    // ST(0) contains the backing texture width. Stop at the last video texel's center.
+    __asm {
+        fld dword ptr [esi+1Ch]
+        fsub MovieHalfTexel
+        fdivrp st(1), st(0)
+        fstp dword ptr [esp+28h]
+        ret
+    }
+}
+
+__declspec(naked) void MovieBottomEdgeThunk() {
+    __asm {
+        fld dword ptr [esi+20h]
+        fsub MovieHalfTexel
+        fdivrp st(1), st(0)
+        fstp dword ptr [esp+20h]
+        ret
+    }
+}
+
 __declspec(naked) void RaceViewThunk() {
     __asm {
         push ebx
@@ -1228,6 +1251,13 @@ struct CallSite {
 // patched constants used by the preceding scale call have their axes reversed.
 const CallSite movieLayoutSite = {
     0x0D7BC8, 13, {0x8B, 0x16, 0x6A, 0, 0x6A, 0, 0x6A, 0, 0x8B, 0xCE, 0xFF, 0x52, 0x04}, MovieLayoutThunk
+};
+
+// The movie surface is padded to powers of two. Bilinear filtering at the
+// content's far edge would otherwise sample the undecoded padding.
+const CallSite movieEdgeSites[] = {
+    {0x14B402, 7, {0xD8, 0x7E, 0x1C, 0xD9, 0x5C, 0x24, 0x24}, MovieRightEdgeThunk},
+    {0x14B40D, 7, {0xD8, 0x7E, 0x20, 0xD9, 0x5C, 0x24, 0x1C}, MovieBottomEdgeThunk},
 };
 
 // This covers the two calls and their stack cleanup in the race view loop.
@@ -1325,6 +1355,9 @@ bool InstallHooks(BYTE* image) {
 
     BYTE* movieLayout = image + movieLayoutSite.rva;
     if (memcmp(movieLayout, movieLayoutSite.expected, movieLayoutSite.size) != 0) return false;
+    for (const auto& site : movieEdgeSites) {
+        if (memcmp(image + site.rva, site.expected, site.size) != 0) return false;
+    }
     for (const auto& site : sites) {
         if (memcmp(image + site.rva, site.expected, site.size) != 0) return false;
     }
@@ -1338,15 +1371,26 @@ bool InstallHooks(BYTE* image) {
         VirtualProtect(start, length, protection, &protection);
         return false;
     }
+    BYTE* movieEdges = image + movieEdgeSites[0].rva;
+    const SIZE_T movieEdgeLength = movieEdgeSites[1].rva + movieEdgeSites[1].size - movieEdgeSites[0].rva;
+    DWORD movieEdgeProtection;
+    if (!VirtualProtect(movieEdges, movieEdgeLength, PAGE_EXECUTE_READWRITE, &movieEdgeProtection)) {
+        VirtualProtect(movieLayout, movieLayoutSite.size, movieProtection, &movieProtection);
+        VirtualProtect(start, length, protection, &protection);
+        return false;
+    }
 
     gameImage = image;
     gameTick = reinterpret_cast<const DWORD*>(image + 0x3221DC);
     frontEndAspect = reinterpret_cast<const float*>(image + 0x25D900);
     for (const auto& site : sites) WriteCall(image, site);
     WriteCall(image, movieLayoutSite);
+    for (const auto& site : movieEdgeSites) WriteCall(image, site);
+    FlushInstructionCache(GetCurrentProcess(), movieEdges, movieEdgeLength);
     FlushInstructionCache(GetCurrentProcess(), movieLayout, movieLayoutSite.size);
     FlushInstructionCache(GetCurrentProcess(), start, length);
     VirtualProtect(movieLayout, movieLayoutSite.size, movieProtection, &movieProtection);
+    VirtualProtect(movieEdges, movieEdgeLength, movieEdgeProtection, &movieEdgeProtection);
     VirtualProtect(start, length, protection, &protection);
     return true;
 }

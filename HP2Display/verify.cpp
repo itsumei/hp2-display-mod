@@ -112,6 +112,36 @@ void VerifyMovieLayout(BYTE* site) {
     puts("Startup logo and intro are scaled proportionally and centered");
 }
 
+float RunMovieEdge(BYTE* site, float textureSide, float contentSide) {
+    float dimensions[9]{};
+    dimensions[7] = dimensions[8] = contentSide;
+    float result;
+    __asm {
+        push esi
+        lea esi, dimensions
+        mov eax, site
+        fld textureSide
+        sub esp, 28h
+        // Calling the patched block adds a return address beyond the game's stack layout.
+        mov dword ptr [esp+18h], 0
+        mov dword ptr [esp+20h], 0
+        call eax
+        fld dword ptr [esp+18h]
+        fadd dword ptr [esp+20h]
+        add esp, 28h
+        pop esi
+        fstp result
+    }
+    return result;
+}
+
+void VerifyMovieEdges(BYTE* image) {
+    assert(RunMovieEdge(image + movieEdgeSites[0].rva, 1024.0f, 720.0f) == 719.5f / 1024.0f);
+    assert(RunMovieEdge(image + movieEdgeSites[1].rva, 512.0f, 496.0f) == 495.5f / 512.0f);
+    assert(RunMovieEdge(image + movieEdgeSites[0].rva, 1024.0f, 640.0f) == 639.5f / 1024.0f);
+    puts("Movie UVs stop at the last decoded texel on padded surfaces");
+}
+
 BYTE cameraData[0x48];
 CameraPose poseAtDraw;
 unsigned raceDraws;
@@ -646,10 +676,12 @@ int wmain(int argc, wchar_t** argv) {
     assert(race[0] == 0xE8 && memcmp(car, carViewSite.expected, carViewSite.size) != 0);
     for (const auto& site : sites) image[site.rva + site.size] = 0xC3;
     image[movieLayoutSite.rva + movieLayoutSite.size] = 0xC3;
+    for (const auto& site : movieEdgeSites) image[site.rva + site.size] = 0xC3;
     image[raceViewSite.rva + raceViewSite.size] = 0xC3;
     image[carViewSite.rva + carViewSite.size] = 0xC3;
     FlushInstructionCache(GetCurrentProcess(), image, 0x460000);
     VerifyMovieLayout(image + movieLayoutSite.rva);
+    VerifyMovieEdges(image);
     VerifyRaceInterpolation(image);
     VerifyFpsLayout();
 
@@ -756,4 +788,5 @@ int wmain(int argc, wchar_t** argv) {
     VirtualFree(image, 0, MEM_RELEASE);
     VerifyFramePacing();
     VerifyPresentTrace();
+    return 0;
 }
