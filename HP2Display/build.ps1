@@ -39,20 +39,30 @@ New-Item -Path $tempDir -ItemType Directory | Out-Null
 $object = Join-Path $tempDir 'HP2Display.obj'
 $source = Join-Path $PSScriptRoot 'HP2Display.cpp'
 $binary = Join-Path $tempDir 'HP2Display.asi'
-$compilerFlags = @('/LD')
-$libraries = @('kernel32.lib')
+$compiler = Join-Path $msvc 'bin\Hostx64\x86\cl.exe'
+$headers = @("/I$msvc/include", "/I$sdkInclude/$version/shared", "/I$sdkInclude/$version/um", "/I$sdkInclude/$version/ucrt")
+$libraryPaths = @("/LIBPATH:$msvc/lib/x86", "/LIBPATH:$sdk/Lib/$version/um/x86", "/LIBPATH:$sdk/Lib/$version/ucrt/x86")
+$compilerFlags = @('/LD', '/DHP2DISPLAY_INTEGRATED')
+$libraries = @('kernel32.lib', 'user32.lib')
+$extraObjects = @()
 if ($Verify) {
     $source = Join-Path $PSScriptRoot 'verify.cpp'
     $binary = Join-Path $tempDir 'verify.exe'
     $compilerFlags = @('/wd4740')
-    $libraries += 'user32.lib'
 }
 try {
-    & "$msvc\bin\Hostx64\x86\cl.exe" /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT @compilerFlags `
-        "/I$msvc/include" "/I$sdkInclude/$version/shared" "/I$sdkInclude/$version/um" `
-        "/I$sdkInclude/$version/ucrt" "/Fo$object" "/Fe$binary" $source `
-        /link /MACHINE:X86 "/LIBPATH:$msvc/lib/x86" "/LIBPATH:$sdk/Lib/$version/um/x86" `
-        "/LIBPATH:$sdk/Lib/$version/ucrt/x86" @libraries
+    if (!$Verify) {
+        $widescreenSource = Join-Path $PSScriptRoot '..\HP2WSFix\dllmain.cpp'
+        $widescreenObject = Join-Path $tempDir 'HP2WSFix.obj'
+        # Compile upstream-derived code separately so its warnings do not weaken HP2Display's checks.
+        & $compiler /nologo /c /O2 /W4 /EHsc /MT /DWIN32 /DNDEBUG /D_CRT_SECURE_NO_WARNINGS `
+            /DHP2DISPLAY_INTEGRATED @headers "/Fo$widescreenObject" $widescreenSource
+        if ($LASTEXITCODE -ne 0) { throw "HP2WSFix compile failed with exit code $LASTEXITCODE." }
+        $extraObjects += $widescreenObject
+        $libraries += 'shell32.lib'
+    }
+    & $compiler /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT @compilerFlags @headers `
+        "/Fo$object" "/Fe$binary" $source @extraObjects /link /MACHINE:X86 @libraryPaths @libraries
     if ($LASTEXITCODE -ne 0) { throw "HP2Display build failed with exit code $LASTEXITCODE." }
     if ($Verify) {
         # Load the game's Direct3D wrapper in isolation, with third-party ASIs disabled.

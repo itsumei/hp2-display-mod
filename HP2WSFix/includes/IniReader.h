@@ -12,7 +12,7 @@ class CIniReader
 {
 public:
 	char m_szFileName[MAX_PATH];
-	CIniReader(char* szFileName)
+	CIniReader(const char* szFileName)
 	{
 		char			moduleName[MAX_PATH];
 		char			dllPath[MAX_PATH];

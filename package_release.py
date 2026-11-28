@@ -24,8 +24,8 @@ def staging_directory(parent: Path):
 
 
 def build_release(tag: str, output: Path | None) -> Path:
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
-        raise ValueError("Expected a release tag like v0.1.0")
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[1-9][0-9]*)?", tag):
+        raise ValueError("Expected a release tag like v0.3.0 or v0.3.0-rc.1")
 
     root = Path(__file__).resolve().parent
     # Build from the tagged tree so uncommitted files cannot affect the release.
@@ -43,6 +43,9 @@ def build_release(tag: str, output: Path | None) -> Path:
         project = staging / source_name
         with zipfile.ZipFile(io.BytesIO(snapshot)) as source:
             source.extractall(staging)
+        build_script = project / "HP2Display/build.ps1"
+        if b"/DHP2DISPLAY_INTEGRATED" not in build_script.read_bytes():
+            raise ValueError("Use the packaging script from the requested tag for the two-ASI releases")
         loader = (project / "third_party/Ultimate-ASI-Loader/d3d8.dll").read_bytes()
         if hashlib.sha256(loader).hexdigest() != "9a2bb218ab014fa4ad56104108c26ae48bf3e22595c126cd4f41367c799da722":
             raise ValueError("The bundled d3d8.dll does not match the tested loader")
@@ -50,13 +53,7 @@ def build_release(tag: str, output: Path | None) -> Path:
         plugin = project / "out" / "HP2Display.asi"
         subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             str(project / "HP2Display" / "build.ps1"), "-OutputPath", str(plugin)],
-            cwd=project, check=True,
-        )
-        widescreen_output = project / "out" / "HP2WSFix"
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             str(project / "HP2WSFix" / "build.ps1"), "-OutputDirectory", str(widescreen_output)],
+             str(build_script), "-OutputPath", str(plugin)],
             cwd=project, check=True,
         )
 
@@ -65,7 +62,6 @@ def build_release(tag: str, output: Path | None) -> Path:
             "global.ini": (project / "config/global.ini").read_bytes(),
             "scripts/HP2Display.asi": plugin.read_bytes(),
             "scripts/HP2Display.ini": (project / "config/HP2Display.ini").read_bytes(),
-            "scripts/HP2WSFix.asi": (widescreen_output / "HP2WSFix.asi").read_bytes(),
             "scripts/HP2WSFix.ini": (project / "config/HP2WSFix.ini").read_bytes(),
             "scripts/HP2WSFix_LowMem.ini": (project / "config/HP2WSFix_LowMem.ini").read_bytes(),
             "licenses/HP2WSFix.txt": (project / "HP2WSFix/LICENSE").read_bytes(),

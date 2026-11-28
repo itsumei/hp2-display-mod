@@ -2328,9 +2328,9 @@ int InitRenderCaps(bool startup)
 	return 0;
 }
 
-int InitConfig()
+int InitConfig(const char* configFile)
 {
-	CIniReader inireader("");
+	CIniReader inireader(configFile);
 	char resolutionMode[32] = {};
 	GetPrivateProfileStringA("HP2WSFix", "Resolution", "Desktop", resolutionMode,
 		sizeof(resolutionMode), inireader.GetIniPath());
@@ -2659,21 +2659,26 @@ int InitInjector()
 	return 0;
 }
 
+void InitializeWidescreen(const char* configFile)
+{
+	InitConfig(configFile);
+	if (bEnableConsole)
+	{
+		AttachConsole(ATTACH_PARENT_PROCESS);
+		AllocConsole();
+		freopen("CON", "r", stdin);
+		freopen("CON", "w", stdout);
+		freopen("CON", "w", stderr);
+	}
+	InitInjector();
+}
+
+#ifndef HP2DISPLAY_INTEGRATED
 BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
 {
 	if (reason == DLL_PROCESS_ATTACH)
-	{
-		InitConfig();
-		if (bEnableConsole)
-		{
-			AttachConsole(ATTACH_PARENT_PROCESS);
-			AllocConsole();
-			freopen("CON", "r", stdin);
-			freopen("CON", "w", stdout);
-			freopen("CON", "w", stderr);
-		}
-		InitInjector();
-	}
+		InitializeWidescreen("");
 	return TRUE;
 }
+#endif
 

@@ -237,6 +237,50 @@ void VerifyRaceInterpolation(BYTE* image) {
     RunRaceView(site, director, 1);
     assert(raceDraws == 4 && !cameraBlendedThisFrame && poseAtDraw.eye.x == second.eye.x);
     image[0x3221EC] = 0;
+    const auto setView = [&](const CameraPose& camera, float carX) {
+        cameraCutThisFrame = false;
+        cameraBlendedThisFrame = false;
+        carsBlendedThisFrame = 0;
+        stockCars[0].position.x = carX;
+        stockCars[1].position.x = carX + 10;
+        WriteCamera(cameraData, camera);
+        RunRaceView(site, director, 1);
+    };
+    *tick = 20;
+    setView(first, 10);
+    ++*tick;
+    setView(second, 11);
+    assert(cameraBlendedThisFrame && carsBlendedThisFrame == 2);
+
+    // A look-back cut can flip the direction without changing controller.
+    CameraPose lookBack = second;
+    lookBack.target.y = -10;
+    setView(lookBack, 11);
+    assert(cameraCutThisFrame && !cameraBlendedThisFrame && !carsBlendedThisFrame);
+    assert(poseAtDraw.target.y == -10 && carsAtDraw[0].position.x == 11 && carsAtDraw[1].position.x == 21);
+    setView(lookBack, 11);
+    assert(cameraCutThisFrame && carsAtDraw[0].position.x == 11);
+
+    // The next step begins from the pose already shown at the cut.
+    ++*tick;
+    lookBack.eye.x += 1;
+    setView(lookBack, 12);
+    assert(!cameraCutThisFrame && cameraBlendedThisFrame && carsBlendedThisFrame == 2);
+    assert(std::fabs(carsAtDraw[0].position.x - poseAtDraw.eye.x - 10.0f) < 0.001f);
+
+    DWORD newController = 1;
+    memcpy(director + 0x164, &newController, sizeof(newController));
+    setView(lookBack, 12);
+    assert(cameraCutThisFrame && !carsBlendedThisFrame);
+
+    // Turning off the new option keeps the former behavior on a view switch.
+    syncCameraCuts = false;
+    ++*tick;
+    newController = 2;
+    memcpy(director + 0x164, &newController, sizeof(newController));
+    setView(second, 13);
+    assert(!cameraCutThisFrame && !cameraBlendedThisFrame && carsBlendedThisFrame == 2);
+    syncCameraCuts = true;
     puts("Race interpolation: shared subframes for camera/player/opponent, rigid rotation, cuts, and x86 render hooks passed");
 }
 
@@ -400,15 +444,16 @@ void VerifyPresentTrace() {
     frameTraceSeconds = 1;
     LONGLONG second = counterFrequency.QuadPart;
     frameTrace.mode = 2;
-    RecordPresent(second, second + 100, 0, false, false, false, 0, S_OK);
+    RecordPresent(second, second + 100, 0, false, false, false, 0, S_OK, false, 0);
     assert(frameTrace.size == 0);
-    RecordPresent(second + 500, second + 600, 1, true, true, true, 6, S_OK);
+    RecordPresent(second + 500, second + 600, 1, true, true, true, 6, S_OK, false, 0);
     assert(frameTrace.size == 1 && frameTrace.rows[0].interval == 0 && frameTrace.rows[0].present == 100);
     frameTrace.previousLog = 200;
-    RecordPresent(second + 3500, second + 3600, 1, true, true, true, 5, S_OK);
+    RecordPresent(second + 3500, second + 3600, 1, true, true, true, 5, S_OK, false, 200);
     const auto& row = frameTrace.rows[1];
-    assert(row.interval == 3000 && row.previousLog == 200 && row.tick == 1 && row.mode == 2 && row.cars == 5);
-    RecordPresent(second * 2 + 600, second * 2 + 700, 60, true, false, false, 0, S_OK);
+    assert(row.interval == 3000 && row.previousLog == 200 && row.pacingWait == 200 &&
+           row.tick == 1 && row.mode == 2 && row.cars == 5);
+    RecordPresent(second * 2 + 600, second * 2 + 700, 60, true, false, false, 0, S_OK, true, 0);
     assert(frameTrace.finished && frameTrace.size == 3);
 
     WIN32_FIND_DATAW traceFile{};
@@ -426,12 +471,25 @@ void VerifyPresentTrace() {
     FILE* csv = nullptr;
     assert(_wfopen_s(&csv, traceFile.cFileName, L"rb") == 0 && csv);
     char line[200];
-    assert(fgets(line, sizeof(line), csv) && strstr(line, "previous_log_ms,tick"));
+    assert(fgets(line, sizeof(line), csv) && strstr(line, "camera_cut_sync,pacing_wait_ms"));
     assert(fgets(line, sizeof(line), csv) && strstr(line, ",1,2,1,1,6,1,0x00000000"));
     assert(fgets(line, sizeof(line), csv) && strstr(line, ",1,2,1,1,5,1,0x00000000"));
-    assert(fgets(line, sizeof(line), csv) && strstr(line, ",60,2,0,0,0,1,0x00000000"));
+    assert(fgets(line, sizeof(line), csv) && strstr(line, ",60,2,0,0,0,1,0x00000000,1,0.000"));
     fclose(csv);
     puts("Per-frame trace: timing, physics ticks and buffered CSV export passed");
+}
+
+void VerifyFramePacing() {
+    for (UINT fps : {60u, 120u, 240u}) {
+        const LONGLONG period = 240000 / fps;
+        LONGLONG next = 0;
+        assert(SchedulePresent(next, 10000, period) == 10000);
+        assert(SchedulePresent(next, 10000 + period / 2, period) == 10000 + period);
+        const LONGLONG afterStall = 10000 + 8 * period;
+        assert(SchedulePresent(next, afterStall, period) == afterStall);
+        assert(SchedulePresent(next, afterStall, period) == afterStall + period);
+    }
+    puts("Frame pacing: 60, 120 and 240 FPS deadlines and recovery after a late frame passed");
 }
 
 void VerifyAntialiasedPixels(void* device) {
@@ -480,6 +538,71 @@ void VerifyAntialiasedPixels(void* device) {
            desc.multisample, edgePixels);
 }
 
+UINT expectedReflectionExtent;
+
+void __fastcall MockReflectionConstructor(BYTE* target, void*, DWORD kind, UINT width, UINT height,
+                                          DWORD depthBits, float viewportWidth, float viewportHeight, DWORD options) {
+    assert(target && kind == 1 && depthBits == 24 && options == 0xFF000000);
+    assert(width == expectedReflectionExtent && height == expectedReflectionExtent);
+    assert(viewportWidth == static_cast<float>(width) && viewportHeight == static_cast<float>(height));
+}
+
+void VerifyReflectionViewport() {
+    using TargetHook = decltype(&ConfigureReflectionTarget);
+    const auto original = makeReflectionTarget;
+    makeReflectionTarget = reinterpret_cast<MakeReflectionTarget>(MockReflectionConstructor);
+    auto targetHook = reinterpret_cast<TargetHook>(ReflectionTargetThunk);
+    alignas(void*) BYTE target[16]{};
+    for (UINT extent : {128u, 256u, 512u, 1024u}) {
+        expectedReflectionExtent = activeReflectionSize = extent;
+        targetHook(target, nullptr, 1, 128, 128, 24, 128.0f, 128.0f, 0xFF000000);
+    }
+    makeReflectionTarget = original;
+    activeReflectionSize = reflectionTargetsSeen = 0;
+    puts("Reflection x86 hook: texture and pixel viewport match at 128, 256, 512 and 1024");
+}
+
+void VerifyReflectionTarget(void* device, DWORD colorFormat, DWORD depthFormat) {
+    struct LockedRect { int pitch; void* pixels; };
+    constexpr UINT size = 512;
+    constexpr DWORD color = 0xFF245068;
+    assert(CanAllocateReflections(device, size, colorFormat, depthFormat));
+    assert(!CanAllocateReflections(device, size, 0, depthFormat));
+
+    void* texture = nullptr;
+    void* target = nullptr;
+    void* depth = nullptr;
+    void* backbuffer = nullptr;
+    void* mainDepth = nullptr;
+    void* readback = nullptr;
+    assert(ComMethod<HRESULT (WINAPI*)(void*, UINT, UINT, UINT, DWORD, DWORD, DWORD, void**)>(device, 20)
+           (device, size, size, 1, 1, colorFormat, 0, &texture) == S_OK);
+    assert(ComMethod<HRESULT (WINAPI*)(void*, UINT, void**)>(texture, 15)(texture, 0, &target) == S_OK);
+    assert(ComMethod<HRESULT (WINAPI*)(void*, UINT, UINT, DWORD, DWORD, void**)>(device, 26)
+           (device, size, size, depthFormat, 0, &depth) == S_OK);
+    assert(ComMethod<HRESULT (WINAPI*)(void*, void**)>(device, 32)(device, &backbuffer) == S_OK);
+    assert(ComMethod<HRESULT (WINAPI*)(void*, void**)>(device, 33)(device, &mainDepth) == S_OK);
+    auto setTarget = ComMethod<HRESULT (WINAPI*)(void*, void*, void*)>(device, 31);
+    assert(setTarget(device, target, depth) == S_OK);
+    assert(ComMethod<ClearSurface>(device, 36)(device, 0, nullptr, 3, color, 1.0f, 0) == S_OK);
+    assert(setTarget(device, backbuffer, mainDepth) == S_OK);
+
+    assert(ComMethod<HRESULT (WINAPI*)(void*, UINT, UINT, DWORD, DWORD, BOOL, void**)>(device, 25)
+           (device, size, size, colorFormat, 0, TRUE, &readback) == S_OK);
+    assert(ComMethod<HRESULT (WINAPI*)(void*, void*, const RECT*, UINT, void*, const POINT*)>(device, 28)
+           (device, target, nullptr, 0, readback, nullptr) == S_OK);
+    LockedRect locked{};
+    assert(ComMethod<HRESULT (WINAPI*)(void*, LockedRect*, const RECT*, DWORD)>(readback, 9)
+           (readback, &locked, nullptr, 0x10) == S_OK);
+    const auto* middle = reinterpret_cast<const DWORD*>(static_cast<const BYTE*>(locked.pixels) + (size / 2) * locked.pitch);
+    assert((middle[size / 2] & 0x00FFFFFF) == (color & 0x00FFFFFF));
+    assert(ComMethod<HRESULT (WINAPI*)(void*)>(readback, 10)(readback) == S_OK);
+    for (void* resource : {readback, mainDepth, backbuffer, depth, target, texture}) {
+        ComMethod<ULONG (WINAPI*)(void*)>(resource, 2)(resource);
+    }
+    puts("Real x86 wrapper: seven 512x512 pairs allocated; reflection target bound, cleared and read back with MSAA");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -500,6 +623,18 @@ int wmain(int argc, wchar_t** argv) {
     assert(memcmp(race, raceViewSite.expected, raceViewSite.size) == 0);
     assert(LoadSettings(nullptr, nullptr, nullptr) && !raceInterpolation && msaaSamples == DefaultMsaaSamples);
     assert(memcmp(race, raceViewSite.expected, raceViewSite.size) == 0);
+    assert(reflectionSize == 0);
+    BYTE* firstReflection = image + reflectionSites[0].rva;
+    BYTE* secondReflection = image + reflectionSites[1].rva;
+    secondReflection[1] ^= 1;
+    assert(!InstallReflectionHooks(image));
+    assert(memcmp(firstReflection, reflectionSites[0].expected, reflectionSites[0].size) == 0);
+    secondReflection[1] ^= 1;
+    assert(InstallReflectionHooks(image));
+    assert(firstReflection[0] == 0xE8 && secondReflection[0] == 0xE8);
+    assert(memcmp(firstReflection, reflectionSites[0].expected, reflectionSites[0].size) != 0);
+    assert(memcmp(secondReflection, reflectionSites[1].expected, reflectionSites[1].size) != 0);
+    VerifyReflectionViewport();
     BYTE* car = image + carViewSite.rva;
     car[1] ^= 1;
     assert(!InstallRaceHooks(image) && memcmp(race, raceViewSite.expected, raceViewSite.size) == 0);
@@ -609,6 +744,7 @@ int wmain(int argc, wchar_t** argv) {
     if (msaaModes.count) {
         assert(RunReset(image + sites[4].rva, device, &input) == S_OK);
         VerifyAntialiasedPixels(device);
+        VerifyReflectionTarget(device, mode.format, input.depthStencilFormat);
         assert(DrawFpsOverlay(device) && RunPresent(image + sites[0].rva, device) == S_OK);
     } else {
         puts("Real x86 wrapper: no compatible multisampling mode reported");
@@ -618,5 +754,6 @@ int wmain(int argc, wchar_t** argv) {
     DestroyWindow(window);
     FreeLibrary(wrapper);
     VirtualFree(image, 0, MEM_RELEASE);
+    VerifyFramePacing();
     VerifyPresentTrace();
 }

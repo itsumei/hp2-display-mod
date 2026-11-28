@@ -11,6 +11,10 @@
 #include <limits>
 #include <vector>
 
+#ifdef HP2DISPLAY_INTEGRATED
+void InitializeWidescreen(const char* configFile);
+#endif
+
 namespace {
 
 // Direct3D 8 ABI, used by both native D3D8 and the bundled D3D8-to-D3D9 wrapper.
@@ -57,6 +61,9 @@ using ResetDevice = HRESULT (WINAPI*)(void*, PresentParameters*);
 using PresentFrame = HRESULT (WINAPI*)(void*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
 HMODULE pluginModule;
+#ifdef HP2DISPLAY_INTEGRATED
+bool widescreenIntegrated;
+#endif
 BYTE* gameImage;
 const DWORD* gameTick;
 const float* frontEndAspect;
@@ -64,13 +71,20 @@ wchar_t logPath[MAX_PATH];
 INIT_ONCE settingsOnce = INIT_ONCE_STATIC_INIT;
 UINT maxRefreshHz = AutoRefresh;
 int vsync = 1;
+UINT frameLimit;
+HANDLE frameTimer;
+void* pacedDevice;
+LONGLONG nextPresentDeadline;
 UINT sampleSeconds = 5;
 UINT frameTraceSeconds;
 UINT msaaSamples;
+UINT reflectionSize;
 bool showFps;
 LARGE_INTEGER counterFrequency;
 bool raceInterpolation;
+bool syncCameraCuts = true;
 bool InstallRaceHooks(BYTE* image);
+bool InstallReflectionHooks(BYTE* image);
 
 constexpr double SimulationHz = 60.0;
 
@@ -130,12 +144,16 @@ const BYTE* raceDirector;
 const BYTE* playerCar;
 RenderFrame raceFrame;
 bool cameraBlendedThisFrame;
+bool cameraCutThisFrame;
+bool holdCarsAtCurrentTick;
 bool playerBlendedThisFrame;
 UINT carsBlendedThisFrame;
 
 void ClearRaceHistory() {
     raceClock = {};
     cameraHistory = {};
+    cameraOwner = nullptr;
+    holdCarsAtCurrentTick = false;
     lastDirector = nullptr;
     memset(cars, 0, sizeof(cars));
 }
@@ -265,10 +283,10 @@ void Log(const char* format, ...) {
 }
 
 struct PresentTraceRow {
-    LONGLONG returned, interval, present, previousLog;
+    LONGLONG returned, interval, present, previousLog, pacingWait;
     DWORD tick, mode, result;
     UINT cars;
-    bool camera, player, race;
+    bool camera, player, race, cameraCut;
 };
 
 struct PresentTrace {
@@ -306,14 +324,16 @@ unsigned __stdcall SavePresentTrace(void*) {
         Log("Frame trace: could not open %ls", path);
         return 1;
     }
-    fputs("elapsed_ms,frame_ms,present_ms,previous_log_ms,tick,mode,camera_blended,player_blended,cars_blended,race_view,present_hresult\n", file);
+    fputs("elapsed_ms,frame_ms,present_ms,previous_log_ms,tick,mode,camera_blended,player_blended,cars_blended,"
+          "race_view,present_hresult,camera_cut_sync,pacing_wait_ms\n", file);
     double toMilliseconds = 1000.0 / static_cast<double>(counterFrequency.QuadPart);
     for (size_t i = 0; i < frameTrace.size; ++i) {
         const auto& row = frameTrace.rows[i];
-        fprintf(file, "%.3f,%.3f,%.3f,%.3f,%lu,%lu,%d,%d,%u,%d,0x%08lX\n",
+        fprintf(file, "%.3f,%.3f,%.3f,%.3f,%lu,%lu,%d,%d,%u,%d,0x%08lX,%d,%.3f\n",
                 (row.returned - frameTrace.start) * toMilliseconds, row.interval * toMilliseconds,
                 row.present * toMilliseconds, row.previousLog * toMilliseconds,
-                row.tick, row.mode, row.camera, row.player, row.cars, row.race, row.result);
+                row.tick, row.mode, row.camera, row.player, row.cars, row.race, row.result,
+                row.cameraCut, row.pacingWait * toMilliseconds);
     }
     bool written = !ferror(file);
     if (fclose(file) != 0) written = false;
@@ -328,7 +348,7 @@ unsigned __stdcall SavePresentTrace(void*) {
 }
 
 void RecordPresent(LONGLONG entered, LONGLONG returned, DWORD tick, bool race, bool camera, bool player,
-                   UINT carCount, HRESULT result) {
+                   UINT carCount, HRESULT result, bool cameraCut, LONGLONG pacingWait) {
     auto& trace = frameTrace;
     if (!trace.size) {
         // Start on the first successful frame with active simulation, after menus and loading.
@@ -344,7 +364,8 @@ void RecordPresent(LONGLONG entered, LONGLONG returned, DWORD tick, bool race, b
     }
 
     trace.rows[trace.size++] = {returned, returned - trace.previousReturn, returned - entered, trace.previousLog,
-                                tick, trace.mode, static_cast<DWORD>(result), carCount, camera, player, race};
+                                pacingWait, tick, trace.mode, static_cast<DWORD>(result), carCount,
+                                camera, player, race, cameraCut};
     trace.previousReturn = returned;
     trace.previousLog = 0;
     if (returned - trace.start >= counterFrequency.QuadPart * frameTraceSeconds ||
@@ -387,8 +408,22 @@ BOOL CALLBACK LoadSettings(PINIT_ONCE, PVOID, PVOID*) {
     maxRefreshHz = ParseRefreshLimit(refresh);
     int sync = static_cast<int>(GetPrivateProfileIntW(L"Display", L"VSync", 1, path));
     vsync = (sync >= -1 && sync <= 1) ? sync : 1;
+    UINT limit = GetPrivateProfileIntW(L"Display", L"FrameLimit", 0, path);
+    frameLimit = limit <= 1000 ? limit : 0;
+    if (frameLimit) {
+        frameTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!frameTimer) frameTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    }
     UINT aa = GetPrivateProfileIntW(L"Graphics", L"MSAA", DefaultMsaaSamples, path);
     msaaSamples = (aa == 2 || aa == 4 || aa == 8) ? aa : 0;
+    UINT size = GetPrivateProfileIntW(L"Graphics", L"ReflectionSize", 0, path);
+    if (size == 256 || size == 512 || size == 1024) {
+        if (InstallReflectionHooks(gameImage)) reflectionSize = size;
+        else Log("Reflections: unsupported allocation sites; using game defaults");
+    } else if (size != 0) {
+        Log("Reflections: invalid ReflectionSize=%u; using game defaults", size);
+    }
     UINT seconds = GetPrivateProfileIntW(L"Diagnostics", L"SampleSeconds", 5, path);
     sampleSeconds = seconds <= 60 ? seconds : 5;
     frameTraceSeconds = GetPrivateProfileIntW(L"Diagnostics", L"FrameTraceSeconds", 0, path);
@@ -396,12 +431,18 @@ BOOL CALLBACK LoadSettings(PINIT_ONCE, PVOID, PVOID*) {
     showFps = GetPrivateProfileIntW(L"Overlay", L"ShowFPS", 0, path) == 1;
     QueryPerformanceFrequency(&counterFrequency);
     bool requested = GetPrivateProfileIntW(L"Interpolation", L"Camera", 0, path) == 1;
+    syncCameraCuts = GetPrivateProfileIntW(L"Interpolation", L"SyncCameraCuts", 1, path) != 0;
     raceInterpolation = requested && counterFrequency.QuadPart > 0 && InstallRaceHooks(gameImage);
     char refreshPolicy[20] = "Auto";
     if (maxRefreshHz != AutoRefresh) sprintf_s(refreshPolicy, "%u", maxRefreshHz);
     Log("HP2Display started: max_refresh=%s vsync=%d msaa=%u sample_seconds=%u trace_seconds=%u race_interpolation=%s fps_overlay=%s",
         refreshPolicy, vsync, msaaSamples, sampleSeconds, frameTraceSeconds,
         raceInterpolation ? "camera+cars" : requested ? "unavailable" : "disabled", showFps ? "enabled" : "disabled");
+    Log("Frame pacing: limit_fps=%u, camera_cut_sync=%s",
+        frameLimit, raceInterpolation && syncCameraCuts ? "enabled" : "disabled");
+#ifdef HP2DISPLAY_INTEGRATED
+    Log("HP2WSFix: %s", widescreenIntegrated ? "integrated" : "standalone ASI detected");
+#endif
     return TRUE;
 }
 
@@ -546,6 +587,93 @@ struct BackbufferDescription {
     DWORD format, resourceType, usage, pool, size, multisample;
     UINT width, height;
 };
+
+constexpr UINT ReflectionTargetCount = 7;
+using MakeReflectionTarget = void (__thiscall*)(BYTE*, DWORD, UINT, UINT, DWORD, float, float, DWORD);
+using FindReflectionColor = DWORD (__thiscall*)(void*, DWORD);
+using FindReflectionDepth = bool (__thiscall*)(void*, DWORD, DWORD, DWORD*, DWORD*, DWORD*);
+MakeReflectionTarget makeReflectionTarget;
+FindReflectionColor findReflectionColor;
+FindReflectionDepth findReflectionDepth;
+UINT activeReflectionSize;
+UINT reflectionTargetsReady;
+UINT reflectionTargetsSeen;
+
+bool CanAllocateReflections(void* device, UINT size, DWORD colorFormat, DWORD depthFormat) {
+    auto createTexture = ComMethod<HRESULT (WINAPI*)(void*, UINT, UINT, UINT, DWORD, DWORD, DWORD, void**)>(device, 20);
+    auto createDepth = ComMethod<HRESULT (WINAPI*)(void*, UINT, UINT, DWORD, DWORD, void**)>(device, 26);
+    void* colors[ReflectionTargetCount]{};
+    void* depths[ReflectionTargetCount]{};
+    // Probe the full group with the game's formats, usage, pool and sample count.
+    bool available = true;
+    for (UINT i = 0; i < ReflectionTargetCount && available; ++i) {
+        available = SUCCEEDED(createTexture(device, size, size, 1, 1, colorFormat, 0, &colors[i])) && colors[i] &&
+                    SUCCEEDED(createDepth(device, size, size, depthFormat, 0, &depths[i])) && depths[i];
+    }
+    for (UINT i = 0; i < ReflectionTargetCount; ++i) {
+        if (depths[i]) ComMethod<ULONG (WINAPI*)(void*)>(depths[i], 2)(depths[i]);
+        if (colors[i]) ComMethod<ULONG (WINAPI*)(void*)>(colors[i], 2)(colors[i]);
+    }
+    return available;
+}
+
+UINT SelectReflectionSize(UINT stockSize, DWORD depthBits) {
+    void* device = *reinterpret_cast<void**>(gameImage + 0x447068);
+    void* formatSelector = *reinterpret_cast<void**>(gameImage + 0x446834);
+    void* renderer = *reinterpret_cast<void**>(gameImage + 0x322C04);
+    if (!device || !formatSelector || !renderer) return stockSize;
+    // A render-target texture is single-sampled. Keep the stock path if the engine
+    // itself requests multisampled offscreen depth, independently of backbuffer MSAA.
+    const BYTE* surfaceSettings = *reinterpret_cast<BYTE**>(static_cast<BYTE*>(renderer) + 4);
+    if (!surfaceSettings || *reinterpret_cast<const DWORD*>(surfaceSettings + 0x18) != 0) return stockSize;
+    DWORD stencilBits = 0;
+    DWORD depthFormat = 0;
+    const DWORD colorFormat = findReflectionColor(formatSelector, depthBits);
+    if (!colorFormat || !findReflectionDepth(renderer, 0, 1, &depthBits, &stencilBits, &depthFormat)) return stockSize;
+    for (UINT candidate = reflectionSize; candidate > stockSize; candidate /= 2) {
+        if (CanAllocateReflections(device, candidate, colorFormat, depthFormat)) return candidate;
+    }
+    return stockSize;
+}
+
+bool ReadReflectionTarget(BYTE* target, UINT size) {
+    BYTE* color = *reinterpret_cast<BYTE**>(target + 8);
+    BYTE* depth = *reinterpret_cast<BYTE**>(target + 12);
+    if (!color || !depth) return false;
+    BYTE* colorData = *reinterpret_cast<BYTE**>(color + 0x24);
+    BYTE* depthData = *reinterpret_cast<BYTE**>(depth + 0x24);
+    if (!colorData || !depthData) return false;
+    void* texture = *reinterpret_cast<void**>(colorData + 0x18);
+    void* surface = *reinterpret_cast<void**>(depthData + 0x1C);
+    if (!texture || !surface) return false;
+    BackbufferDescription colorDesc{}, depthDesc{};
+    return SUCCEEDED(ComMethod<HRESULT (WINAPI*)(void*, UINT, BackbufferDescription*)>(texture, 14)(texture, 0, &colorDesc)) &&
+           SUCCEEDED(ComMethod<HRESULT (WINAPI*)(void*, BackbufferDescription*)>(surface, 8)(surface, &depthDesc)) &&
+           colorDesc.width == size && colorDesc.height == size && depthDesc.width == size && depthDesc.height == size &&
+           colorDesc.multisample == depthDesc.multisample;
+}
+
+void __fastcall ConfigureReflectionTarget(BYTE* target, void*, DWORD kind, UINT width, UINT height,
+                                          DWORD depthBits, float viewportWidth, float viewportHeight, DWORD options) {
+    // The environment map is constructed first, followed by six views in the same call chain.
+    if (kind == 0) {
+        activeReflectionSize = SelectReflectionSize(width, depthBits);
+        reflectionTargetsReady = reflectionTargetsSeen = 0;
+    }
+    if (activeReflectionSize > width) {
+        // The constructor takes viewport extents in pixels, as well as texture sizes.
+        // Leaving these at 128 would draw into only one corner of the larger surface.
+        viewportWidth *= static_cast<float>(activeReflectionSize) / width;
+        viewportHeight *= static_cast<float>(activeReflectionSize) / height;
+        width = height = activeReflectionSize;
+    }
+    makeReflectionTarget(target, kind, width, height, depthBits, viewportWidth, viewportHeight, options);
+    if (ReadReflectionTarget(target, width)) ++reflectionTargetsReady;
+    if (++reflectionTargetsSeen == ReflectionTargetCount) {
+        Log("Reflections: requested=%u selected=%u verified_targets=%u/%u",
+            reflectionSize, width, reflectionTargetsReady, ReflectionTargetCount);
+    }
+}
 
 struct Viewport {
     UINT x, y, width, height;
@@ -752,6 +880,7 @@ HRESULT WINAPI OnCreateDevice(void* d3d, UINT adapter, DWORD type, HWND window, 
 
 HRESULT WINAPI OnReset(void* device, PresentParameters* parameters) {
     InitOnceExecuteOnce(&settingsOnce, LoadSettings, nullptr, nullptr);
+    if (pacedDevice == device) nextPresentDeadline = 0;
     auto reset = ComMethod<ResetDevice>(device, 14);
     if (fpsOverlay.device == device) fpsOverlay = {};
     DeviceCreation creation{};
@@ -770,19 +899,52 @@ HRESULT WINAPI OnReset(void* device, PresentParameters* parameters) {
     return result;
 }
 
+LONGLONG SchedulePresent(LONGLONG& next, LONGLONG now, LONGLONG period) {
+    // Re-anchor after a late frame instead of releasing several frames to catch up.
+    const LONGLONG deadline = next > now ? next : now;
+    next = deadline + period;
+    return deadline;
+}
+
+LONGLONG PacePresent(void* device) {
+    const LONGLONG frequency = counterFrequency.QuadPart;
+    LARGE_INTEGER now;
+    if (!frameLimit || !frequency || !QueryPerformanceCounter(&now)) return 0;
+
+    if (pacedDevice != device) {
+        pacedDevice = device;
+        nextPresentDeadline = 0;
+    }
+    const LONGLONG deadline = SchedulePresent(nextPresentDeadline, now.QuadPart, frequency / frameLimit);
+    const LONGLONG remaining = deadline - now.QuadPart;
+    if (!remaining) return 0;
+
+    // Use a relative timer so changes to the system clock cannot affect the wait.
+    LARGE_INTEGER due;
+    due.QuadPart = -(remaining * 10000000 + frequency - 1) / frequency;
+    if (!frameTimer || !SetWaitableTimer(frameTimer, &due, 0, nullptr, nullptr, FALSE) ||
+        WaitForSingleObject(frameTimer, INFINITE) != WAIT_OBJECT_0) {
+        Sleep(static_cast<DWORD>((remaining * 1000 + frequency - 1) / frequency));
+    }
+    return now.QuadPart;
+}
+
 HRESULT WINAPI OnPresent(void* device, const RECT* source, const RECT* destination,
                          HWND window, const RGNDATA* dirty) {
     // Consume render diagnostics once, even if Present fails or the next frame is a menu.
     bool cameraBlended = cameraBlendedThisFrame;
+    bool cameraCut = cameraCutThisFrame;
     bool playerBlended = playerBlendedThisFrame;
     UINT carsBlended = carsBlendedThisFrame;
     bool raceView = raceViewThisFrame;
     cameraBlendedThisFrame = false;
+    cameraCutThisFrame = false;
     playerBlendedThisFrame = false;
     carsBlendedThisFrame = 0;
     raceViewThisFrame = false;
     if (showFps) DrawFpsOverlay(device);
     auto present = ComMethod<PresentFrame>(device, 15);
+    LONGLONG pacingStart = PacePresent(device);
     LARGE_INTEGER entered{};
     bool tracing = frameTraceSeconds && !frameTrace.finished && counterFrequency.QuadPart &&
                    QueryPerformanceCounter(&entered);
@@ -793,9 +955,11 @@ HRESULT WINAPI OnPresent(void* device, const RECT* source, const RECT* destinati
         QueryPerformanceCounter(&now);
     }
     if (tracing && now.QuadPart) {
-        RecordPresent(entered.QuadPart, now.QuadPart, traceTick, raceView, cameraBlended, playerBlended, carsBlended, result);
+        RecordPresent(entered.QuadPart, now.QuadPart, traceTick, raceView, cameraBlended, playerBlended,
+                      carsBlended, result, cameraCut, pacingStart ? entered.QuadPart - pacingStart : 0);
     }
     if (FAILED(result)) {
+        nextPresentDeadline = 0;
         sample = {};
         fpsOverlay.counter = {};
         return result;
@@ -942,7 +1106,9 @@ void WINAPI RenderRaceView(BYTE* director, int viewCount) {
     if (frameTraceSeconds && !frameTrace.finished) raceViewThisFrame = true;
     lastDirector = director;
     // All cars and the camera use the same tick and blend fraction for this view.
-    raceFrame = SampleRenderClock(raceClock, *gameTick, now.QuadPart, counterFrequency.QuadPart);
+    RenderFrame next = SampleRenderClock(raceClock, *gameTick, now.QuadPart, counterFrequency.QuadPart);
+    if (next.reset || next.tick != raceFrame.tick) holdCarsAtCurrentTick = false;
+    raceFrame = next;
     if (raceFrame.reset) memset(cars, 0, sizeof(cars));
     raceDirector = director;
     memcpy(&playerCar, director + 0x12C, sizeof(playerCar));
@@ -950,15 +1116,25 @@ void WINAPI RenderRaceView(BYTE* director, int viewCount) {
     BYTE* camera = ComMethod<BYTE* (__thiscall*)(void*)>(director, 2)(director);
     DWORD controllerIndex;
     memcpy(&controllerIndex, director + 0x164, sizeof(controllerIndex));
-    if (cameraOwner != camera || cameraController != controllerIndex) cameraHistory = {};
+    CameraPose stock = camera ? ReadCamera(camera) : CameraPose{};
+    const bool switchedView = cameraOwner != camera || cameraController != controllerIndex;
+    if (syncCameraCuts && cameraHistory.tracked &&
+        (switchedView || !IsContinuous(cameraHistory.current, stock))) {
+        // A cut uses the current stock camera. Keep cars on that same tick until the
+        // next simulation step so subsequent subframes cannot jump back in time.
+        holdCarsAtCurrentTick = true;
+    }
+    if (holdCarsAtCurrentTick) {
+        raceFrame.alpha = 1.0f;
+        cameraCutThisFrame = true;
+    }
+    if (switchedView) cameraHistory = {};
     cameraOwner = camera;
     cameraController = controllerIndex;
 
-    CameraPose stock;
     BYTE stockTransform[0x60];
     bool useBlendedCamera = false;
     if (camera) {
-        stock = ReadCamera(camera);
         useBlendedCamera = AdvancePose(cameraHistory, raceFrame, stock);
         if (useBlendedCamera) {
             // Both original calls consume the controller's look-at inputs.
@@ -1036,6 +1212,11 @@ __declspec(naked) void CarViewThunk() {
     __asm jmp RenderCar
 }
 
+__declspec(naked) void ReflectionTargetThunk() {
+    // Thiscall and fastcall both pass the target in ECX. EDX has no game argument.
+    __asm jmp ConfigureReflectionTarget
+}
+
 struct CallSite {
     DWORD rva;
     BYTE size;
@@ -1057,6 +1238,11 @@ const CallSite raceViewSite = {
 
 const CallSite carViewSite = {0x0CA978, 5, {0xE8, 0xC3, 0x0F, 0xF6, 0xFF}, CarViewThunk};
 
+const CallSite reflectionSites[] = {
+    {0x13E158, 5, {0xE8, 0xB3, 0x3E, 0, 0}, ReflectionTargetThunk},
+    {0x13E183, 5, {0xE8, 0x88, 0x3E, 0, 0}, ReflectionTargetThunk},
+};
+
 const CallSite sites[] = {
     {0x156E48, 6, {0x6A, 0, 0x50, 0xFF, 0x51, 0x3C}, PresentThunk},
     {0x1573B2, 6, {0x6A, 0, 0x50, 0xFF, 0x52, 0x3C}, PresentThunk},
@@ -1073,6 +1259,34 @@ void WriteCall(BYTE* image, const CallSite& site) {
     address[0] = 0xE8;
     memcpy(address + 1, &relative, sizeof(relative));
     memset(address + 5, 0x90, site.size - 5);
+}
+
+bool InstallReflectionHooks(BYTE* image) {
+    // Refuse to mix this patch with a different reflection implementation.
+    for (const auto& site : reflectionSites) {
+        if (memcmp(image + site.rva, site.expected, site.size) != 0) return false;
+    }
+    constexpr BYTE stockSizePushes[] = {0x68, 0x80, 0, 0, 0, 0x68, 0x80, 0, 0, 0};
+    constexpr BYTE makeTargetStart[] = {0x55, 0x8B, 0xEC, 0x51, 0x8B, 0x45, 0x08};
+    constexpr BYTE findColorStart[] = {0x83, 0xEC, 0x08, 0x53, 0x55, 0x56, 0x57};
+    constexpr BYTE findDepthStart[] = {0xA1, 0x64, 0x70, 0x84, 0, 0x53, 0x55, 0x56};
+    if (memcmp(image + 0x13E143, stockSizePushes, sizeof(stockSizePushes)) != 0 ||
+        memcmp(image + 0x13E175, stockSizePushes, sizeof(stockSizePushes)) != 0 ||
+        memcmp(image + 0x142010, makeTargetStart, sizeof(makeTargetStart)) != 0 ||
+        memcmp(image + 0x159C70, findColorStart, sizeof(findColorStart)) != 0 ||
+        memcmp(image + 0x158BE0, findDepthStart, sizeof(findDepthStart)) != 0) return false;
+
+    BYTE* start = image + reflectionSites[0].rva;
+    SIZE_T length = reflectionSites[1].rva + reflectionSites[1].size - reflectionSites[0].rva;
+    DWORD protection;
+    if (!VirtualProtect(start, length, PAGE_EXECUTE_READWRITE, &protection)) return false;
+    makeReflectionTarget = reinterpret_cast<MakeReflectionTarget>(image + 0x142010);
+    findReflectionColor = reinterpret_cast<FindReflectionColor>(image + 0x159C70);
+    findReflectionDepth = reinterpret_cast<FindReflectionDepth>(image + 0x158BE0);
+    for (const auto& site : reflectionSites) WriteCall(image, site);
+    FlushInstructionCache(GetCurrentProcess(), start, length);
+    VirtualProtect(start, length, protection, &protection);
+    return true;
 }
 
 bool InstallRaceHooks(BYTE* image) {
@@ -1137,16 +1351,47 @@ bool InstallHooks(BYTE* image) {
     return true;
 }
 
+#ifdef HP2DISPLAY_INTEGRATED
+bool HasStandaloneWidescreen(HMODULE module) {
+    if (GetModuleHandleW(L"HP2WSFix.asi")) return true;
+
+    wchar_t path[MAX_PATH];
+    const DWORD count = GetModuleFileNameW(module, path, MAX_PATH);
+    wchar_t* leaf = count && count < MAX_PATH ? wcsrchr(path, L'\\') : nullptr;
+    if (!leaf) return false;
+
+    // An older install may still load this sibling after HP2Display.
+    const size_t remaining = std::size(path) - (leaf + 1 - path);
+    if (remaining < std::size(L"HP2WSFix.asi")) return false;
+    wcscpy_s(leaf + 1, remaining, L"HP2WSFix.asi");
+    const DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+#endif
+
 } // namespace
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         pluginModule = module;
+        auto* image = reinterpret_cast<BYTE*>(GetModuleHandleW(nullptr));
+#ifdef HP2DISPLAY_INTEGRATED
+        // HP2WSFix 2.5 uses absolute addresses in the supported x86 executable.
+        if (reinterpret_cast<ULONG_PTR>(image) != 0x400000) return FALSE;
+#endif
         // The loader holds the ASI for the lifetime of the game.
-        if (!InstallHooks(reinterpret_cast<BYTE*>(GetModuleHandleW(nullptr)))) {
+        if (!InstallHooks(image)) {
             OutputDebugStringA("HP2Display: unsupported game executable or modified renderer call sites.\n");
             return FALSE;
         }
+#ifdef HP2DISPLAY_INTEGRATED
+        if (!HasStandaloneWidescreen(module)) {
+            // Keep reading the existing widescreen INI after merging the two ASIs.
+            InitializeWidescreen("HP2WSFix.ini");
+            widescreenIntegrated = true;
+        }
+#endif
     }
+    if (reason == DLL_PROCESS_DETACH && frameTimer) CloseHandle(frameTimer);
     return TRUE;
 }
